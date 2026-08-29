@@ -202,6 +202,19 @@ class TorboxClient(DownloadClient):
                 msg = "Unexpected Torbox torrent response"
                 _raise_type_error(msg)
             return self._handle_torrent(torrent, state)
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as error:
+            logger.warning(
+                "Temporary Torbox API problem checking %s; will retry on next poll: %s",
+                download_id,
+                error,
+            )
+            return DownloadStatus(
+                state.progress,
+                DownloadState.DOWNLOADING,
+                "TorBox API temporarily unavailable; retrying",
+                False,
+                None,
+            )
         except Exception as error:
             logger.exception("Error checking Torbox status for %s", download_id)
             return DownloadStatus.error(str(error))
@@ -405,22 +418,92 @@ class TorboxClient(DownloadClient):
             if not torrent_name:
                 return DownloadStatus.error("TorBox returned a ready torrent without a name")
 
-            # TorBox WebDAV exposes each torrent as a top-level directory.
-            # Reject obviously unsafe names rather than allowing path traversal.
-            name_path = Path(torrent_name)
-            if name_path.is_absolute() or ".." in name_path.parts:
-                return DownloadStatus.error("TorBox returned an unsafe torrent name")
-
             mount_value = config_text(
                 config.get("TORBOX_MOUNT_PATH", "/mnt/torbox-audiobooks")
             )
             mount_root = Path(mount_value or "/mnt/torbox-audiobooks")
-            completed_path = mount_root / torrent_name
+
+            # Prefer the actual top-level directory reported by TorBox's
+            # file list. This handles torrents whose WebDAV directory differs
+            # from TorBox's friendly/display name.
+            top_levels: list[str] = []
+            files = torrent.get("files") or []
+
+            if isinstance(files, list):
+                for file_info in files:
+                    if not isinstance(file_info, dict):
+                        continue
+
+                    raw_name = str(file_info.get("name") or "").strip("/")
+                    if not raw_name:
+                        continue
+
+                    parts = Path(raw_name).parts
+                    if len(parts) > 1:
+                        top_levels.append(parts[0])
+
+            if top_levels and len(set(top_levels)) == 1:
+                folder_name = top_levels[0]
+            else:
+                folder_name = torrent_name
+
+            name_path = Path(folder_name)
+            if name_path.is_absolute() or ".." in name_path.parts:
+                return DownloadStatus.error("TorBox returned an unsafe WebDAV path")
+
+            completed_path = mount_root / folder_name
+
+            # TorBox can expose the WebDAV directory before the files inside
+            # it have propagated. Do not report COMPLETE until Shelfmark can
+            # actually see a usable audiobook/archive payload.
+            payload_exts = {
+                ".m4b", ".mp3", ".m4a", ".mp4", ".flac", ".ogg",
+                ".wma", ".aac", ".wav", ".opus", ".zip", ".rar",
+            }
+
+            payload_visible = False
+
+            if completed_path.is_dir():
+                try:
+                    payload_visible = any(
+                        child.is_file() and child.suffix.lower() in payload_exts
+                        for child in completed_path.rglob("*")
+                    )
+                except OSError as error:
+                    logger.debug(
+                        "TorBox WebDAV path not fully readable yet for %s: %s",
+                        download_id,
+                        error,
+                    )
+
+            if not payload_visible:
+                with state.lock:
+                    state.target_dir = completed_path
+                    state.phase = "waiting_webdav"
+                    state.progress = 99.0
+
+                logger.info(
+                    "TorBox ready; waiting for audiobook files on WebDAV: %s",
+                    completed_path,
+                )
+
+                return DownloadStatus(
+                    99.0,
+                    DownloadState.DOWNLOADING,
+                    "TorBox ready; waiting for WebDAV files",
+                    False,
+                    None,
+                )
 
             with state.lock:
                 state.target_dir = completed_path
                 state.phase = "complete"
                 state.progress = 100.0
+
+            logger.info(
+                "TorBox WebDAV path is now available: %s",
+                completed_path,
+            )
 
             return DownloadStatus(
                 100.0,
