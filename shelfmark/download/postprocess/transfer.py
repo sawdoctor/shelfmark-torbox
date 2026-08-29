@@ -41,8 +41,92 @@ logger = setup_logger("shelfmark.download.postprocess.pipeline")
 _TRANSFER_PROCESS_ERRORS = (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError)
 
 
+def should_symlink_torbox(task: DownloadTask) -> bool:
+    """Use symlinks only for TorBox-backed audiobook torrents."""
+    if not task.original_download_path:
+        return False
+
+    if not check_audiobook(task.content_type):
+        return False
+
+    client = str(
+        core_config.config.get("PROWLARR_TORRENT_CLIENT", "") or ""
+    ).strip().lower()
+    if client != "torbox":
+        return False
+
+    mount_value = str(
+        core_config.config.get(
+            "TORBOX_MOUNT_PATH",
+            "/mnt/torbox-audiobooks",
+        )
+        or "/mnt/torbox-audiobooks"
+    )
+
+    mount_root = Path(mount_value)
+    source_root = Path(task.original_download_path)
+
+    # Require absolute same-path mounts. A symlink that only works inside
+    # Shelfmark but not inside Audiobookshelf would be useless.
+    if not mount_root.is_absolute() or not source_root.is_absolute():
+        return False
+
+    try:
+        source_root.relative_to(mount_root)
+    except ValueError:
+        return False
+
+    return True
+
+
+def _create_symlink_no_fallback(source_path: Path, dest_path: Path) -> Path:
+    """Create an absolute symlink and NEVER fall back to copying."""
+    if not source_path.is_absolute():
+        raise RuntimeError(
+            f"Refusing TorBox symlink with non-absolute source: {source_path}"
+        )
+
+    if not run_blocking_io(source_path.exists):
+        raise RuntimeError(
+            f"TorBox source does not exist on mounted storage: {source_path}"
+        )
+
+    run_blocking_io(dest_path.parent.mkdir, parents=True, exist_ok=True)
+    target = str(source_path)
+
+    # Idempotent retry is allowed only when the existing symlink has the
+    # exact same target. Never overwrite a normal file or different link.
+    if run_blocking_io(os.path.lexists, dest_path):
+        if (
+            run_blocking_io(dest_path.is_symlink)
+            and run_blocking_io(os.readlink, dest_path) == target
+        ):
+            return dest_path
+
+        raise FileExistsError(
+            f"Refusing to replace existing destination during TorBox symlink import: "
+            f"{dest_path}"
+        )
+
+    try:
+        run_blocking_io(os.symlink, target, dest_path)
+    except FileExistsError:
+        # Handle a concurrent identical import safely.
+        if (
+            run_blocking_io(dest_path.is_symlink)
+            and run_blocking_io(os.readlink, dest_path) == target
+        ):
+            return dest_path
+        raise
+
+    return dest_path
+
+
 def should_hardlink(task: DownloadTask) -> bool:
     """Check if hardlinking is enabled for this torrent-backed task."""
+    if should_symlink_torbox(task):
+        return False
+
     if not task.original_download_path:
         return False
 
@@ -145,9 +229,13 @@ def _transfer_single_file(
     *,
     use_hardlink: bool,
     is_torrent: bool,
+    use_symlink: bool,
     preserve_source: bool = False,
     max_attempts: int = 100,
 ) -> tuple[Path, str]:
+    if use_symlink:
+        return _create_symlink_no_fallback(source_path, dest_path), "symlink"
+
     if use_hardlink:
         final_path = atomic_hardlink(source_path, dest_path, max_attempts=max_attempts)
         try:
@@ -188,15 +276,24 @@ def transfer_book_files(
     *,
     use_hardlink: bool,
     is_torrent: bool,
+    use_symlink: bool | None = None,
     preserve_source: bool = False,
     organization_mode: str | None = None,
     source_root: Path | None = None,
 ) -> tuple[list[Path], str | None, dict[str, int]]:
     """Transfer discovered book files into their final destination layout."""
     if not book_files:
-        return [], "No book files found", {"hardlink": 0, "copy": 0, "move": 0}
+        return [], "No book files found", {"symlink": 0, "hardlink": 0, "copy": 0, "move": 0}
 
     is_audiobook = check_audiobook(task.content_type)
+
+    if use_symlink is None:
+        use_symlink = should_symlink_torbox(task)
+
+    if use_symlink:
+        # TorBox audiobook mode is reference-only. Never hardlink/copy/move.
+        use_hardlink = False
+
     organization_mode = organization_mode or get_file_organization(is_audiobook=is_audiobook)
 
     groups = resolve_book_groups(task, book_files, organization_mode=organization_mode)
@@ -207,6 +304,7 @@ def transfer_book_files(
             task,
             use_hardlink=use_hardlink,
             is_torrent=is_torrent,
+            use_symlink=use_symlink,
             preserve_source=preserve_source,
             organization_mode=organization_mode,
         )
@@ -214,7 +312,7 @@ def transfer_book_files(
     max_attempts = _max_attempts_for_batch(len(book_files))
 
     final_paths: list[Path] = []
-    op_counts: dict[str, int] = {"hardlink": 0, "copy": 0, "move": 0}
+    op_counts: dict[str, int] = {"symlink": 0, "hardlink": 0, "copy": 0, "move": 0}
 
     if organization_mode == "organize":
         template = get_template(is_audiobook=is_audiobook, organization_mode="organize")
@@ -237,6 +335,7 @@ def transfer_book_files(
                 dest_path,
                 use_hardlink=use_hardlink,
                 is_torrent=is_torrent,
+                use_symlink=use_symlink,
                 preserve_source=preserve_source,
                 max_attempts=max_attempts,
             )
@@ -264,6 +363,7 @@ def transfer_book_files(
                     dest_path,
                     use_hardlink=use_hardlink,
                     is_torrent=is_torrent,
+                    use_symlink=use_symlink,
                     preserve_source=preserve_source,
                     max_attempts=max_attempts,
                 )
@@ -304,6 +404,7 @@ def transfer_book_files(
             dest_path,
             use_hardlink=use_hardlink,
             is_torrent=is_torrent,
+            use_symlink=use_symlink,
             preserve_source=preserve_source,
             max_attempts=max_attempts,
         )
@@ -356,6 +457,7 @@ def _transfer_book_groups(
     *,
     use_hardlink: bool,
     is_torrent: bool,
+    use_symlink: bool,
     preserve_source: bool,
     organization_mode: str,
 ) -> tuple[list[Path], str | None, dict[str, int]]:
@@ -366,7 +468,7 @@ def _transfer_book_groups(
     leak onto its siblings, while author and series name apply to all of them.
     """
     all_paths: list[Path] = []
-    totals: dict[str, int] = {"hardlink": 0, "copy": 0, "move": 0}
+    totals: dict[str, int] = {"symlink": 0, "hardlink": 0, "copy": 0, "move": 0}
     errors: list[str] = []
 
     for group in groups:
@@ -385,6 +487,7 @@ def _transfer_book_groups(
             book_task,
             use_hardlink=use_hardlink,
             is_torrent=is_torrent,
+            use_symlink=use_symlink,
             preserve_source=preserve_source,
             organization_mode=organization_mode,
             source_root=group.files[0].parent,
@@ -549,7 +652,7 @@ def transfer_directory_to_library(
 
     is_torrent = is_torrent_source(source_dir, task)
     transferred_paths: list[Path] = []
-    op_counts: dict[str, int] = {"hardlink": 0, "copy": 0, "move": 0}
+    op_counts: dict[str, int] = {"symlink": 0, "hardlink": 0, "copy": 0, "move": 0}
     max_attempts = _max_attempts_for_batch(len(source_files))
 
     if len(source_files) == 1:

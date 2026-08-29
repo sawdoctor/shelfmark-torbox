@@ -106,6 +106,7 @@ def process_folder_output(
         prepare_output_files,
         record_step,
         resolve_book_groups,
+        should_symlink_torbox,
         transfer_book_files,
     )
 
@@ -160,6 +161,8 @@ def process_folder_output(
     # "Move" is implemented as a client-side cleanup after import.
     preserve_source = is_usenet or preserve_source_on_failure
 
+    use_symlink = should_symlink_torbox(task)
+
     copy_for_label = (
         is_torrent or preserve_source or prepared.output_plan.stage_action != STAGE_NONE
     )
@@ -174,7 +177,9 @@ def process_folder_output(
         )
         return None
 
-    if use_hardlink:
+    if use_symlink:
+        op_label = "Symlinking"
+    elif use_hardlink:
         op_label = "Hardlinking"
     elif is_usenet and usenet_action == "move" and prepared.output_plan.stage_action == STAGE_NONE:
         # Presented as a move, but implemented as copy + client cleanup.
@@ -192,6 +197,7 @@ def process_folder_output(
         source=str(source_path),
         dest=str(plan.destination),
         hardlink=use_hardlink,
+        symlink=use_symlink,
         torrent=copy_for_label,
     )
     if prepared.output_plan.stage_action != STAGE_NONE:
