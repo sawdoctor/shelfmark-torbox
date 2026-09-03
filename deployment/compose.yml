@@ -1,0 +1,22 @@
+services:
+  shelfmark-torbox:
+    build:
+      context: ..
+      target: shelfmark-lite
+
+    image: shelfmark-torbox:test
+    container_name: shelfmark-torbox
+    restart: unless-stopped
+
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: Europe/London
+
+    ports:
+      - "8084:8084"
+
+    volumes:
+      - /home/sawdoctor/docker/shelfmark-torbox/config:/config
+      - /mnt/usenet_scratch/audiobookshelf-test/audiobooks:/books
+      - /mnt/torbox-audiobooks:/mnt/torbox-audiobooks:ro,rslave

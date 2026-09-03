@@ -241,3 +241,6 @@ CLAUDE.md
 .playwright-mcp/
 frontend-dist/
 node_modules/
+
+# Local pre-patch backups
+*.before-*
