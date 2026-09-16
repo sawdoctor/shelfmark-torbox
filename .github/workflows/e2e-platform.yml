@@ -12,8 +12,6 @@ name: E2E Platform
 
 on:
   pull_request:
-  schedule:
-    - cron: "0 4 * * *"   # nightly full matrix
   workflow_dispatch:
 
 concurrency:
@@ -85,7 +83,7 @@ jobs:
         run: cat tests/e2e/platform/.state/shelfmark.${{ matrix.profile }}.log || true
 
   # Heavy "everything real" job: real Chrome internal bypasser solving Cloudflare +
-  # DoH + real qBittorrent webseed download. Runs on relevant PRs and nightly.
+  # DoH + real qBittorrent webseed download. Runs on relevant PRs and manual dispatch.
   e2e-full:
     needs: changes
     if: needs.changes.outputs.relevant == 'true' || github.event_name != 'pull_request'
