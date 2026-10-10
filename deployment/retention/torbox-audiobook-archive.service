@@ -1,0 +1,15 @@
+[Unit]
+Description=Protect TorBox audiobooks and verify backup-only vault copies
+After=network-online.target rclone-torbox-audiobooks.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=sawdoctor
+Group=sawdoctor
+Environment=HOME=/home/sawdoctor
+EnvironmentFile=-/etc/torbox-audiobook-archive.env
+ExecStart=/usr/local/sbin/torbox-audiobook-archive
+UMask=0077
+Nice=10
+TimeoutStartSec=4h

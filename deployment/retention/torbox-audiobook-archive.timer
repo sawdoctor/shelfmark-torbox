@@ -1,0 +1,10 @@
+[Unit]
+Description=Protect and back up new TorBox audiobooks every ten minutes
+
+[Timer]
+OnCalendar=*:0/10
+Persistent=true
+Unit=torbox-audiobook-archive.service
+
+[Install]
+WantedBy=timers.target

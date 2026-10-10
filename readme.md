@@ -1,5 +1,9 @@
 # 📚 Shelfmark: Book Search & Request Tool
 
+This TorBox fork keeps audiobook payloads on TorBox and imports symlinks for
+Audiobookshelf. [AirLock protection and backup-only vault setup](docs/torbox-retention.md)
+are available for retention without local audiobook storage or Google Drive playback.
+
 <img src="src/frontend/public/logo.png" alt="Shelfmark" width="200">
 
 > [!NOTE]
