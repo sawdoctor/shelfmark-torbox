@@ -49,9 +49,7 @@ def should_symlink_torbox(task: DownloadTask) -> bool:
     if not check_audiobook(task.content_type):
         return False
 
-    client = str(
-        core_config.config.get("PROWLARR_TORRENT_CLIENT", "") or ""
-    ).strip().lower()
+    client = str(core_config.config.get("PROWLARR_TORRENT_CLIENT", "") or "").strip().lower()
     if client != "torbox":
         return False
 
@@ -82,14 +80,10 @@ def should_symlink_torbox(task: DownloadTask) -> bool:
 def _create_symlink_no_fallback(source_path: Path, dest_path: Path) -> Path:
     """Create an absolute symlink and NEVER fall back to copying."""
     if not source_path.is_absolute():
-        raise RuntimeError(
-            f"Refusing TorBox symlink with non-absolute source: {source_path}"
-        )
+        raise RuntimeError(f"Refusing TorBox symlink with non-absolute source: {source_path}")
 
     if not run_blocking_io(source_path.exists):
-        raise RuntimeError(
-            f"TorBox source does not exist on mounted storage: {source_path}"
-        )
+        raise RuntimeError(f"TorBox source does not exist on mounted storage: {source_path}")
 
     run_blocking_io(dest_path.parent.mkdir, parents=True, exist_ok=True)
     target = str(source_path)
@@ -104,8 +98,7 @@ def _create_symlink_no_fallback(source_path: Path, dest_path: Path) -> Path:
             return dest_path
 
         raise FileExistsError(
-            f"Refusing to replace existing destination during TorBox symlink import: "
-            f"{dest_path}"
+            f"Refusing to replace existing destination during TorBox symlink import: {dest_path}"
         )
 
     try:
@@ -591,11 +584,14 @@ def transfer_file_to_library(
     run_blocking_io(dest_path.parent.mkdir, parents=True, exist_ok=True)
 
     is_torrent = is_torrent_source(source_path, task)
+    use_symlink = should_symlink_torbox(task)
+    use_hardlink = use_hardlink and not use_symlink
     final_path, op = _transfer_single_file(
         source_path,
         dest_path,
         use_hardlink=use_hardlink,
         is_torrent=is_torrent,
+        use_symlink=use_symlink,
         max_attempts=_max_attempts_for_batch(1),
     )
     logger.info("Library %s: %s", op, final_path)
@@ -651,6 +647,8 @@ def transfer_directory_to_library(
     run_blocking_io(base_library_path.parent.mkdir, parents=True, exist_ok=True)
 
     is_torrent = is_torrent_source(source_dir, task)
+    use_symlink = should_symlink_torbox(task)
+    use_hardlink = use_hardlink and not use_symlink
     transferred_paths: list[Path] = []
     op_counts: dict[str, int] = {"symlink": 0, "hardlink": 0, "copy": 0, "move": 0}
     max_attempts = _max_attempts_for_batch(len(source_files))
@@ -664,6 +662,7 @@ def transfer_directory_to_library(
             dest_path,
             use_hardlink=use_hardlink,
             is_torrent=is_torrent,
+            use_symlink=use_symlink,
             max_attempts=max_attempts,
         )
         logger.debug("Library %s: %s -> %s", op, source_file.name, final_path)
@@ -686,6 +685,7 @@ def transfer_directory_to_library(
                 file_path,
                 use_hardlink=use_hardlink,
                 is_torrent=is_torrent,
+                use_symlink=use_symlink,
                 max_attempts=max_attempts,
             )
             logger.debug("Library %s: %s -> %s", op, source_file.name, final_path)

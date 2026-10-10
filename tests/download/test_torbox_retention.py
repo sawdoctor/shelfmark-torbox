@@ -17,10 +17,15 @@ from scripts.torbox_audiobook_archive import (
     maintain,
     remote_path,
 )
+from shelfmark.core.models import DownloadTask
 from shelfmark.core.utils import AUDIOBOOK_FORMATS
 from shelfmark.download.clients import DownloadState
 from shelfmark.download.clients.torbox import TorboxClient, _DownloadState
-from shelfmark.download.postprocess.transfer import _create_symlink_no_fallback
+from shelfmark.download.postprocess.transfer import (
+    _create_symlink_no_fallback,
+    transfer_directory_to_library,
+    transfer_file_to_library,
+)
 from shelfmark.torbox_airlock import (
     AUDIO_SUFFIXES,
     EDIT_ROUTES,
@@ -417,3 +422,59 @@ def test_import_still_creates_the_exact_torbox_symlink_with_no_copy(settings):
     _create_symlink_no_fallback(source, destination)
     assert destination.is_symlink()
     assert destination.readlink() == source
+
+
+@pytest.mark.parametrize("layout", ["file", "single_file_directory", "multi_file_directory"])
+def test_all_library_transfer_paths_keep_torbox_audio_as_symlinks(settings, monkeypatch, layout):
+    values = {
+        "TORBOX_MOUNT_PATH": str(settings.mount),
+        "PROWLARR_TORRENT_CLIENT": "torbox",
+        "SUPPORTED_AUDIOBOOK_FORMATS": ["m4b"],
+    }
+    monkeypatch.setattr(
+        "shelfmark.core.config.config.get", lambda key, default=None: values.get(key, default)
+    )
+    source = settings.mount / ("source.m4b" if layout == "file" else "Release")
+    if layout == "file":
+        source.write_bytes(b"audio")
+        files = [source]
+        transfer = transfer_file_to_library
+        input_arg = {"source_path": source}
+    else:
+        source.mkdir()
+        files = [source / "Part01.m4b"]
+        if layout == "multi_file_directory":
+            files.append(source / "Part02.m4b")
+        for file in files:
+            file.write_bytes(b"audio")
+        transfer = transfer_directory_to_library
+        input_arg = {"source_dir": source}
+    task = DownloadTask(
+        task_id="symlink-library",
+        source="prowlarr",
+        title="Book",
+        content_type="audiobook",
+        format="m4b",
+        original_download_path=str(source),
+    )
+    for name in ("atomic_copy", "atomic_move", "atomic_hardlink"):
+        monkeypatch.setattr(
+            f"shelfmark.download.postprocess.transfer.{name}",
+            MagicMock(side_effect=AssertionError("Audio must not be copied or moved")),
+        )
+    result = transfer(
+        **input_arg,
+        library_base=str(settings.library),
+        template="{Title}{ - PartNumber}",
+        metadata={"Title": "Book"},
+        task=task,
+        temp_file=None,
+        status_callback=MagicMock(),
+        use_hardlink=True,
+    )
+    assert result
+    links = list(settings.library.rglob("*.m4b"))
+    assert len(links) == len(files)
+    assert all(link.is_symlink() for link in links)
+    assert {link.readlink() for link in links} == set(files)
+    assert all(file.read_bytes() == b"audio" for file in files)
