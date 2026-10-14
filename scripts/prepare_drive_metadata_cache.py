@@ -212,7 +212,67 @@ def inventory() -> tuple[dict, list[dict], set[str]]:
 
 
 def identity(container: dict) -> dict:
-    return {k: container[k] for k in ('Id', 'Image', 'Config', 'HostConfig', 'Mounts')}
+    snapshot = {k: container[k] for k in ('Id', 'Image', 'Config', 'HostConfig')}
+    # Docker's inspect mount enumeration order is not a runtime setting.
+    snapshot['Mounts'] = sorted(container['Mounts'], key=lambda m: m['Destination'])
+    return snapshot
+
+
+def equivalent_replacement(previous: dict, current: dict) -> None:
+    """Permit a replacement ID only with equivalent runtime settings.
+
+    Labels and the new container's generated hostname are retained exactly as
+    currently installed; activation never rewrites them. Environment *values*,
+    image digest, every mount and all other runtime settings must still match.
+    """
+    if previous['Image'] != current['Image']:
+        raise RuntimeError('Replacement audiobook container uses a different image')
+    old_config, new_config = previous['Config'].copy(), current['Config'].copy()
+
+    def environment(config: dict) -> dict[str, str]:
+        entries = config.pop('Env', []) or []
+        values = {}
+        for entry in entries:
+            if '=' not in entry:
+                raise RuntimeError('Nonliteral container environment entry; refusing equivalence')
+            key, value = entry.split('=', 1)
+            if key in values:
+                raise RuntimeError('Duplicate container environment key; refusing uncertain ordering')
+            values[key] = value
+        return values
+
+    old_env, new_env = environment(old_config), environment(new_config)
+    changed_env = sorted(k for k in set(old_env) | set(new_env) if old_env.get(k) != new_env.get(k))
+    if changed_env:
+        raise RuntimeError('Replacement container changed environment values for: ' + ', '.join(changed_env))
+    old_hostname = old_config.pop('Hostname', '')
+    new_hostname = new_config.pop('Hostname', '')
+    if old_hostname != new_hostname and (old_hostname != previous['Id'][:12] or new_hostname != current['Id'][:12]):
+        raise RuntimeError('Replacement container changed a custom hostname')
+    # Metadata is captured into the fresh snapshot, never copied from the old
+    # container or edited by this helper. It may be meaningful to other tools.
+    old_labels = old_config.pop('Labels', {}) or {}
+    new_labels = new_config.pop('Labels', {}) or {}
+    changed_config = sorted(k for k in set(old_config) | set(new_config)
+                            if old_config.get(k) != new_config.get(k))
+    if changed_config:
+        raise RuntimeError('Replacement container changed Config fields: ' + ', '.join(changed_config))
+    old_host, new_host = previous['HostConfig'].copy(), current['HostConfig'].copy()
+    if sorted(old_host.pop('Binds', []) or []) != sorted(new_host.pop('Binds', []) or []):
+        raise RuntimeError('Replacement container changed bind specifications')
+    changed_host = sorted(k for k in set(old_host) | set(new_host) if old_host.get(k) != new_host.get(k))
+    if changed_host:
+        raise RuntimeError('Replacement container changed HostConfig fields: ' + ', '.join(changed_host))
+    def mounts(container: dict) -> dict[str, dict]:
+        values = {m['Destination']: m for m in container['Mounts']}
+        if len(values) != len(container['Mounts']):
+            raise RuntimeError('Duplicate container mount destination')
+        return values
+    if mounts(previous) != mounts(current):
+        raise RuntimeError('Replacement container changed actual mount settings')
+    labels = sorted(k for k in set(old_labels) | set(new_labels) if old_labels.get(k) != new_labels.get(k))
+    announce('Replacement container verified: same image, environment values, binds, mounts and other runtime settings.')
+    announce('Current container ID, hostname and labels will be retained. Changed label keys:', ', '.join(labels) or 'none')
 
 
 def database_snapshot(database: Path, destination: Path) -> dict:
@@ -336,9 +396,17 @@ def activate(stage_name: str, retry: bool = False) -> None:
                            'destination': LEGACY, 'propagation': 'rprivate'}]
     if consumers != expected_consumers or consumers != plan['consumers']:
         raise RuntimeError('Another container consumes this mount; refusing expanded disruption')
-    if (identity(selected) != identity(previous) or selected['Id'] != plan['container_id'] or
-            selected['Image'] != plan['image_id']):
-        raise RuntimeError('Audiobook container image, mounts or configuration changed since preparation')
+    rebased = False
+    if previous['Id'] != plan['container_id'] or previous['Image'] != plan['image_id']:
+        raise RuntimeError('Stored original container snapshot does not match its plan')
+    if identity(selected) != identity(previous):
+        if not retry:
+            raise RuntimeError('Audiobook container image, mounts or configuration changed since preparation')
+        equivalent_replacement(previous, selected)
+        rebased = True
+        previous = selected
+        plan = {**plan, 'container_id': selected['Id'], 'image_id': selected['Image'],
+                'retry_rebased_from_container_id': plan['container_id']}
     env = dict(entry.split('=', 1) for entry in selected['Config'].get('Env', []) if '=' in entry)
     database = host_path(selected['Mounts'], Path(env.get('CONFIG_PATH', '/config')) / 'absdatabase.sqlite')
     if str(database) != plan['database'] or not database.is_file():
@@ -393,6 +461,8 @@ def activate(stage_name: str, retry: bool = False) -> None:
             os.chown(backup, owner.st_uid, owner.st_gid)
         announce('Retained earlier recovery material:', previous_stage)
         announce('Fresh activation and rollback material:', stage)
+        if rebased:
+            announce('Fresh snapshot uses the verified current container; original snapshot is preserved.')
     elif prior_state.exists():
         raise RuntimeError('An activation artifact already exists; use reviewed recovery instructions')
     if OVERRIDE.parent.is_symlink():
