@@ -343,7 +343,7 @@ def activate(stage_name: str) -> None:
             raise RuntimeError('A previously running unrelated container is no longer running')
         # Device identity proves the container bound the current FUSE superblock.
         host_dev = int(command('python3', '-c',
-            'import os; announce(os.stat("/mnt/gdrive-audiobooks").st_dev)', timeout=15).strip())
+            'import os; print(os.stat("/mnt/gdrive-audiobooks").st_dev)', timeout=15).strip())
         probe = r"""
 const fs = require('fs/promises');
 const timer = setTimeout(() => process.exit(124), 45000);
