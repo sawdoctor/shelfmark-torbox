@@ -1,0 +1,42 @@
+name: Publish TorBox release
+on:
+  push:
+    branches: [main]
+    paths:
+      - docs/releases/v0.1.0-torbox.1.md
+      - .github/workflows/publish-torbox-release.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: torbox-release-v0.1.0-torbox.1
+  cancel-in-progress: false
+jobs:
+  publish:
+    if: github.repository == 'sawdoctor/shelfmark-torbox'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Publish tagged source prerelease
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_REPO: ${{ github.repository }}
+          RELEASE_SHA: ${{ github.sha }}
+          RELEASE_TAG: v0.1.0-torbox.1
+        run: |
+          if ! gh release view "$RELEASE_TAG" --repo "$RELEASE_REPO" > /dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --repo "$RELEASE_REPO" \
+              --target "$RELEASE_SHA" --title "TorBox AirLock and audiobook playback maintenance" \
+              --notes-file docs/releases/v0.1.0-torbox.1.md --prerelease
+          fi
+      - name: Dispatch versioned container publication
+        # Token-created tags do not trigger push workflows; dispatch explicitly.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_REPO: ${{ github.repository }}
+        run: gh workflow run build-and-publish-docker-image.yml --repo "$RELEASE_REPO" --ref v0.1.0-torbox.1

@@ -1,4 +1,48 @@
-# 📚 Shelfmark: Book Search & Request Tool
+# 📚 Shelfmark-TorBox: Audiobook playback and retention
+
+This fork keeps TorBox audiobook payloads on TorBox and imports absolute symlinks
+for Audiobookshelf. AirLock protects eligible retained downloads from normal
+inactivity expiry. Google Drive is an independent backup vault; the retention job
+does not stage audio locally or replace TorBox playback links with Drive links.
+
+## TorBox audiobook setup
+
+- **Playback:** retain the existing TorBox mount and library paths accessible inside Audiobookshelf.
+- **Protection:** `Protect Audiobooks with AirLock` defaults on for completed audiobook torrents. The existing ten-minute host job protects uniquely matched active library sources and retries pending protection.
+- **Backup:** copy and verify vault objects between rclone remotes, retaining TorBox symlinks. No remote deletion or unprotection frees capacity.
+- **Legacy Drive books:** pre-existing Drive books remain on their original source, separate from the TorBox backup vault.
+
+See [retention and deployment](docs/torbox-retention.md) and
+[legacy Drive playback maintenance](docs/drive-audiobook-playback.md).
+Fork images use `ghcr.io/sawdoctor/shelfmark-torbox` and
+`ghcr.io/sawdoctor/shelfmark-torbox-lite`. Choose an explicit release tag for a
+versioned update; default-branch nightly images use `dev` and `main`.
+[Release notes](docs/releases/v0.1.0-torbox.1.md) distinguish publication from
+updating an existing server.
+
+### Why the one-hour metadata cache stays in effect
+
+The Drive correction changes rclone's directory metadata lifetime from `5m` to
+`1h`. This keeps folder listings and file information in memory, separately from
+audio buffering and VFS audio caching.
+
+A listing fetched at 19:00 can be reused until about 20:00. When it is stale and
+needed again, rclone refreshes it and keeps the new listing for another hour.
+Polling can invalidate changed entries sooner. The **saved policy remains one
+hour** after every refresh and after normal service/server restarts. A restart
+clears in-memory entries; it does not undo the setting.
+
+The policy is installed as a systemd override. Existing polling, audio-cache
+settings, credentials and library filenames are retained. The legacy filesystem
+view repair also persists on disk.
+
+On 14 October 2026 the user confirmed successful activation and approximately
+two seconds to first audio for *A Tale of Two Cities*. The helper had already
+accessed that book's metadata: this verifies the attempt, not every untouched
+book's first-start latency. Keep the working configuration and rollback backups;
+no further routine tests or restarts are needed.
+
+## Shelfmark features and general setup
 
 <img src="src/frontend/public/logo.png" alt="Shelfmark" width="200">
 
@@ -50,15 +94,19 @@ Works great alongside the following library tools, with support for automatic im
 
 1. Download the [docker-compose file](compose/docker-compose.yml):
    ```bash
-   curl -O https://raw.githubusercontent.com/calibrain/shelfmark/main/compose/docker-compose.yml
+   curl -O https://raw.githubusercontent.com/sawdoctor/shelfmark-torbox/main/compose/docker-compose.yml
    ```
 
-2. Start the service:
+2. For this fork, set the Compose service’s `image` to a versioned
+   `ghcr.io/sawdoctor/shelfmark-torbox` image. Retain existing configuration
+   and mount paths when updating.
+
+3. Start the service:
    ```bash
    docker compose up -d
    ```
 
-3. Open `http://localhost:8084`
+4. Open `http://localhost:8084`
 
 Open the web interface, then configure the sources and settings you want to use.
 
@@ -331,4 +379,4 @@ Use of this tool is entirely at your own risk.
 
 ## Support
 
-For issues or questions, please [file an issue](https://github.com/calibrain/shelfmark/issues) on GitHub.
+For issues or questions, please [file an issue](https://github.com/sawdoctor/shelfmark-torbox/issues) on GitHub.

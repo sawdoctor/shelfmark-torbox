@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, NoReturn, Protocol, TypeGuard
 
 from shelfmark.core.settings_registry import (
     ActionButton,
+    CheckboxField,
     HeadingField,
     PasswordField,
     SelectField,
@@ -565,7 +566,6 @@ def _test_realdebrid_connection(current_values: dict[str, Any] | None = None) ->
     return {"success": success, "message": message}
 
 
-
 def _test_torbox_connection(current_values: dict[str, Any] | None = None) -> dict[str, Any]:
     """Test the TorBox API connection using current form values."""
     from shelfmark.core.config import config
@@ -659,6 +659,17 @@ def prowlarr_clients_settings() -> list[SettingsField]:
             description="Mounted TorBox WebDAV path used for streaming audiobooks",
             placeholder="/mnt/torbox-audiobooks",
             default="/mnt/torbox-audiobooks",
+            show_when={"field": "PROWLARR_TORRENT_CLIENT", "value": "torbox"},
+        ),
+        CheckboxField(
+            key="TORBOX_AUTO_AIRLOCK",
+            label="Protect Audiobooks with AirLock",
+            description=(
+                "Keep completed audiobook sources from expiring through inactivity. "
+                "Requires available AirLock space on a paid TorBox plan. "
+                "If protection fails, playback remains on TorBox and a warning is logged."
+            ),
+            default=True,
             show_when={"field": "PROWLARR_TORRENT_CLIENT", "value": "torbox"},
         ),
         ActionButton(

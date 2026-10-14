@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /usr/bin/python3 /usr/local/lib/torbox-audiobooks/scripts/torbox_audiobook_archive.py --apply "$@"

@@ -13,6 +13,7 @@ import requests
 from shelfmark.config.env import TMP_DIR
 from shelfmark.core.config import config
 from shelfmark.core.logger import setup_logger
+from shelfmark.core.utils import is_audiobook
 from shelfmark.download.clients import (
     DownloadClient,
     DownloadState,
@@ -22,6 +23,7 @@ from shelfmark.download.clients import (
 from shelfmark.download.clients._coercion import config_text
 from shelfmark.download.http import download_url
 from shelfmark.download.network import get_ssl_verify
+from shelfmark.torbox_airlock import AUDIO_SUFFIXES, AirLockAPI, AirLockError
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -38,9 +40,28 @@ _WEBDL_READY_STATES = frozenset({"cached", "completed", "downloaded", "finished"
 _WEBDL_ERROR_STATES = frozenset({"error", "failed", "virus"})
 _WEBDL_POLL_INTERVAL = 2
 _BOOK_EXTENSIONS = (
-    ".aac", ".azw", ".azw3", ".cbr", ".cbz", ".djvu", ".doc", ".docx",
-    ".epub", ".fb2", ".flac", ".lit", ".m4a", ".m4b", ".mobi", ".mp3",
-    ".ogg", ".opus", ".pdf", ".rtf", ".txt", ".wma",
+    ".aac",
+    ".azw",
+    ".azw3",
+    ".cbr",
+    ".cbz",
+    ".djvu",
+    ".doc",
+    ".docx",
+    ".epub",
+    ".fb2",
+    ".flac",
+    ".lit",
+    ".m4a",
+    ".m4b",
+    ".mobi",
+    ".mp3",
+    ".ogg",
+    ".opus",
+    ".pdf",
+    ".rtf",
+    ".txt",
+    ".wma",
 )
 
 
@@ -63,6 +84,9 @@ class _DownloadState:
     error_message: str | None = None
     progress: float = 0.0
     download_thread: threading.Thread | None = None
+    audiobook: bool = False
+    airlock_attempted: bool = False
+    retention_warning: str | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -91,7 +115,6 @@ class TorboxClient(DownloadClient):
         api_key = config_text(config.get("TORBOX_API_KEY", ""))
         return client == "torbox" and bool(api_key)
 
-
     def test_connection(self) -> tuple[bool, str]:
         """Validate Torbox credentials and torrent API access."""
         if not self._api_key:
@@ -108,7 +131,7 @@ class TorboxClient(DownloadClient):
             response.raise_for_status()
             data = self._response_data(response.json())
             if not isinstance(data, dict):
-                raise TypeError("Unexpected Torbox user response")
+                _raise_type_error("Unexpected Torbox user response")
 
             email = str(data.get("email") or "Unknown")
 
@@ -127,6 +150,7 @@ class TorboxClient(DownloadClient):
             return False, f"Connection failed: {error}"
 
         return True, f"Connected to Torbox as '{email}'"
+
     def add_download(
         self,
         url: str,
@@ -160,11 +184,15 @@ class TorboxClient(DownloadClient):
                 msg = "No torrent ID returned from Torbox"
                 _raise_runtime_error(msg)
 
-            mount_value = config_text(
-                config.get("TORBOX_MOUNT_PATH", "/mnt/torbox-audiobooks")
-            )
+            mount_value = config_text(config.get("TORBOX_MOUNT_PATH", "/mnt/torbox-audiobooks"))
             target_dir = Path(mount_value or "/mnt/torbox-audiobooks")
-            state = _DownloadState(torrent_id, name, target_dir, phase="waiting_torbox")
+            state = _DownloadState(
+                torrent_id,
+                name,
+                target_dir,
+                phase="waiting_torbox",
+                audiobook=is_audiobook(config_text(kwargs.get("content_type"))),
+            )
             with self._downloads_lock:
                 self._downloads[torrent_id] = state
         except Exception:
@@ -181,9 +209,21 @@ class TorboxClient(DownloadClient):
             if state.phase == "error":
                 return DownloadStatus.error(state.error_message or "Torbox error")
             if state.phase == "complete":
-                return DownloadStatus(100.0, DownloadState.COMPLETE, "Complete", True, str(state.target_dir))
+                return DownloadStatus(
+                    100.0,
+                    DownloadState.COMPLETE,
+                    state.retention_warning or "Complete",
+                    True,
+                    str(state.target_dir),
+                )
             if state.phase == "downloading_http":
-                return DownloadStatus(state.progress, DownloadState.DOWNLOADING, "Downloading files via HTTP...", False, None)
+                return DownloadStatus(
+                    state.progress,
+                    DownloadState.DOWNLOADING,
+                    "Downloading files via HTTP...",
+                    False,
+                    None,
+                )
 
         try:
             list_url = f"{_API_BASE}/torrents/mylist"
@@ -220,26 +260,15 @@ class TorboxClient(DownloadClient):
             return DownloadStatus.error(str(error))
 
     def remove(self, download_id: str, *, delete_files: bool = False) -> bool:
-        """Delete the torrent from Torbox and clean up local files."""
-        try:
-            url = f"{_API_BASE}/torrents/controltorrent"
-            requests.post(
-                url,
-                headers=self._auth_headers(),
-                json={"torrent_id": int(download_id), "operation": "delete"},
-                timeout=_STATUS_TIMEOUT,
-                verify=get_ssl_verify(url),
-            ).raise_for_status()
-        except (requests.exceptions.RequestException, ValueError) as error:
-            logger.warning("Failed to delete Torbox torrent %s: %s", download_id, error)
+        """Forget local tracking; retain the TorBox source used by playback links.
 
+        Even the generic 'remove after import' action must not delete an item
+        backing symlinks. Explicit source removal belongs in the TorBox dashboard.
+        """
         with self._downloads_lock:
             self._downloads.pop(download_id, None)
-
-        # Never delete filesystem data here. For this client the completed
-        # path is the read-only TorBox WebDAV mount.
+        logger.info("Retained TorBox streaming source %s during cleanup", download_id)
         return True
-
 
     def get_download_path(self, download_id: str) -> str | None:
         """Return the real Torbox WebDAV path for a completed torrent."""
@@ -255,7 +284,7 @@ class TorboxClient(DownloadClient):
             )
             response.raise_for_status()
             torrent = self._response_data(response.json())
-        except (requests.exceptions.RequestException, RuntimeError, TypeError, ValueError):
+        except requests.exceptions.RequestException, RuntimeError, TypeError, ValueError:
             logger.exception("Failed to resolve Torbox WebDAV path for %s", download_id)
             return None
 
@@ -269,9 +298,7 @@ class TorboxClient(DownloadClient):
             return None
 
         mount_root = Path(
-            config_text(
-                config.get("TORBOX_MOUNT_PATH", "/mnt/torbox-audiobooks")
-            )
+            config_text(config.get("TORBOX_MOUNT_PATH", "/mnt/torbox-audiobooks"))
             or "/mnt/torbox-audiobooks"
         )
 
@@ -324,6 +351,7 @@ class TorboxClient(DownloadClient):
         )
 
         return str(completed_path)
+
     def download_web_url(
         self,
         url: str,
@@ -363,7 +391,9 @@ class TorboxClient(DownloadClient):
                 if cancel_flag and cancel_flag.is_set():
                     return None
                 web_download = self._get_web_download(web_id)
-                state = str(web_download.get("download_state", web_download.get("status", ""))).lower()
+                state = str(
+                    web_download.get("download_state", web_download.get("status", ""))
+                ).lower()
                 if state in _WEBDL_ERROR_STATES:
                     msg = str(web_download.get("error") or "Torbox web download failed")
                     _raise_runtime_error(msg)
@@ -400,7 +430,12 @@ class TorboxClient(DownloadClient):
             state = self._downloads.get(download_id)
             if state:
                 return state
-            state = _DownloadState(download_id, f"Download {download_id}", TMP_DIR / f"torbox_{download_id}", phase="waiting_torbox")
+            state = _DownloadState(
+                download_id,
+                f"Download {download_id}",
+                TMP_DIR / f"torbox_{download_id}",
+                phase="waiting_torbox",
+            )
             self._downloads[download_id] = state
             return state
 
@@ -414,13 +449,12 @@ class TorboxClient(DownloadClient):
         progress = float(torrent.get("progress", 0.0)) * 100.0
 
         if status in _READY_STATES:
+            self._protect_audiobook(torrent, state)
             torrent_name = str(torrent.get("name") or state.name).strip()
             if not torrent_name:
                 return DownloadStatus.error("TorBox returned a ready torrent without a name")
 
-            mount_value = config_text(
-                config.get("TORBOX_MOUNT_PATH", "/mnt/torbox-audiobooks")
-            )
+            mount_value = config_text(config.get("TORBOX_MOUNT_PATH", "/mnt/torbox-audiobooks"))
             mount_root = Path(mount_value or "/mnt/torbox-audiobooks")
 
             # Prefer the actual top-level directory reported by TorBox's
@@ -457,8 +491,18 @@ class TorboxClient(DownloadClient):
             # it have propagated. Do not report COMPLETE until Shelfmark can
             # actually see a usable audiobook/archive payload.
             payload_exts = {
-                ".m4b", ".mp3", ".m4a", ".mp4", ".flac", ".ogg",
-                ".wma", ".aac", ".wav", ".opus", ".zip", ".rar",
+                ".m4b",
+                ".mp3",
+                ".m4a",
+                ".mp4",
+                ".flac",
+                ".ogg",
+                ".wma",
+                ".aac",
+                ".wav",
+                ".opus",
+                ".zip",
+                ".rar",
             }
 
             payload_visible = False
@@ -472,7 +516,7 @@ class TorboxClient(DownloadClient):
                 except OSError as error:
                     logger.debug(
                         "TorBox WebDAV path not fully readable yet for %s: %s",
-                        download_id,
+                        state.torrent_id,
                         error,
                     )
 
@@ -508,7 +552,7 @@ class TorboxClient(DownloadClient):
             return DownloadStatus(
                 100.0,
                 DownloadState.COMPLETE,
-                "TorBox ready on mounted storage",
+                state.retention_warning or "TorBox ready on mounted storage",
                 True,
                 str(completed_path),
             )
@@ -540,6 +584,30 @@ class TorboxClient(DownloadClient):
             download_speed=int(torrent.get("download_speed", 0)),
             eta=torrent.get("eta"),
         )
+
+    def _protect_audiobook(self, torrent: dict[str, Any], state: _DownloadState) -> None:
+        """Protect new audiobook sources once ready; the host timer retries failures."""
+        enabled = config.get("TORBOX_AUTO_AIRLOCK", True)
+        if str(enabled).strip().lower() not in {"true", "1", "yes", "on"}:
+            return
+        audio_files = any(
+            Path(str(info.get("name") or "")).suffix.lower() in AUDIO_SUFFIXES
+            for info in torrent.get("files") or []
+            if isinstance(info, dict)
+        )
+        if not (state.audiobook or audio_files):
+            return
+        with state.lock:
+            if state.airlock_attempted:
+                return
+            state.airlock_attempted = True
+        try:
+            AirLockAPI(self._api_key).protect("torrents", torrent)
+        except (AirLockError, KeyError, TypeError, ValueError) as error:
+            state.retention_warning = "TorBox ready; AirLock pending (check archive job)"
+            logger.warning("AirLock pending for TorBox audiobook %s: %s", state.torrent_id, error)
+        else:
+            logger.info("AirLock confirmed for TorBox audiobook %s", state.torrent_id)
 
     def _get_web_download(self, web_id: str) -> dict[str, Any]:
         url = f"{_API_BASE}/webdl/mylist"
@@ -584,7 +652,7 @@ class TorboxClient(DownloadClient):
                 timeout=_STATUS_TIMEOUT,
                 verify=get_ssl_verify(url),
             ).raise_for_status()
-        except (requests.exceptions.RequestException, ValueError):
+        except requests.exceptions.RequestException, ValueError:
             logger.warning("Failed to delete Torbox web download %s", web_id)
 
     @staticmethod
