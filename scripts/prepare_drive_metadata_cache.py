@@ -16,6 +16,7 @@ from pathlib import Path
 import re
 import shlex
 import signal
+import time
 import sqlite3
 import subprocess
 import tempfile
@@ -241,7 +242,67 @@ def announce(*values: object) -> None:
         pass
 
 
-def activate(stage_name: str) -> None:
+def unit_state() -> dict[str, str]:
+    return dict(line.split('=', 1) for line in command(
+        'systemctl', 'show', UNIT, '-p', 'MainPID', '-p', 'ActiveState',
+        '-p', 'SubState', '-p', 'Result', '-p', 'Job', '-p', 'TimeoutStopUSec',
+        '-p', 'TimeoutStartUSec', timeout=15).splitlines() if '=' in line)
+
+
+def duration_seconds(value: str) -> float:
+    scales = {'us': 0.000001, 'ms': 0.001, 's': 1, 'min': 60, 'h': 3600}
+    tokens = re.findall(r'(\d+(?:\.\d+)?)\s*(us|ms|min|s|h)', value)
+    if not tokens or re.sub(r'(\d+(?:\.\d+)?)\s*(us|ms|min|s|h)|\s+', '', value):
+        raise RuntimeError('Service has an unsupported or unbounded restart timeout')
+    return sum(float(amount) * scales[unit] for amount, unit in tokens)
+
+
+def restart_mount() -> None:
+    before = unit_state()
+    # Account for the actual unit's entire stop + start allowance. The manager
+    # owns the job; use nonblocking submission and bounded state polling rather
+    # than killing a waiting systemctl client before that allowance expires.
+    budget = (duration_seconds(before['TimeoutStopUSec']) +
+              duration_seconds(before['TimeoutStartUSec']) + 30)
+    if budget > 600:
+        raise RuntimeError('Service restart allowance exceeds the reviewed bounded operation')
+    if before.get('Job'):
+        raise RuntimeError('A Drive mount job is already pending; refusing another restart')
+    command('systemctl', '--no-block', 'restart', UNIT, timeout=15)
+    started = time.monotonic()
+    reported = -15.0
+    while True:
+        state = unit_state()
+        elapsed = time.monotonic() - started
+        if not state.get('Job'):
+            if state.get('ActiveState') == 'failed':
+                raise RuntimeError('Drive mount restart failed; service Result=' + state.get('Result', 'unknown'))
+            if (state.get('ActiveState') == 'active' and
+                    state.get('MainPID') not in ('0', before.get('MainPID'))):
+                announce('Drive mount restart completed after %.0fs.' % elapsed)
+                return
+        if elapsed >= budget:
+            raise RuntimeError('Drive restart exceeded its stop/start allowance; job may still be pending')
+        if elapsed - reported >= 15:
+            announce('Waiting for Drive mount: %s/%s, %.0fs of %.0fs allowance.' % (
+                state.get('ActiveState', 'unknown'), state.get('SubState', 'unknown'), elapsed, budget))
+            reported = elapsed
+        time.sleep(2)
+
+
+def mount_bound() -> bool:
+    mounted = command('findmnt', '-rn', '-T', str(MOUNT), '-o', 'TARGET,FSTYPE', timeout=10).split()
+    if mounted != [str(MOUNT), 'fuse.rclone']:
+        return False
+    host = int(command('python3', '-c',
+        'import os; print(os.stat("/mnt/gdrive-audiobooks").st_dev)', timeout=15).strip())
+    inside = int(command('docker', 'exec', CONTAINER, 'node', '-e',
+        'require("fs").stat("/mnt/legacy-gdrive-audiobooks",(e,s)=>{if(e)process.exit(1);console.log(s.dev)})',
+        timeout=15).strip())
+    return host == inside
+
+
+def activate(stage_name: str, retry: bool = False) -> None:
     if os.geteuid() != 0:
         raise RuntimeError('Activation requires sudo on this server')
     os.umask(0o077)
@@ -282,8 +343,58 @@ def activate(stage_name: str) -> None:
     database = host_path(selected['Mounts'], Path(env.get('CONFIG_PATH', '/config')) / 'absdatabase.sqlite')
     if str(database) != plan['database'] or not database.is_file():
         raise RuntimeError('Current database location changed since preparation')
-    if OVERRIDE.exists() or OVERRIDE.is_symlink() or (stage / 'activation-state.json').exists():
-        raise RuntimeError('An activation artifact already exists; refusing to overwrite it')
+    if OVERRIDE.exists() or OVERRIDE.is_symlink():
+        raise RuntimeError('An installed activation override already exists; refusing to overwrite it')
+    state = unit_state()
+    if state.get('Job'):
+        raise RuntimeError('A Drive service job is still pending; refusing activation')
+    # Validate finite allowances BEFORE any configuration change or disruption.
+    if duration_seconds(state['TimeoutStopUSec']) + duration_seconds(state['TimeoutStartUSec']) + 30 > 600:
+        raise RuntimeError('Service restart allowance exceeds the reviewed bounded operation')
+    prior_state = stage / 'activation-state.json'
+    if retry:
+        if not prior_state.is_file():
+            raise RuntimeError('Retry requires the retained failed activation state')
+        phase = json.loads(prior_state.read_text()).get('phase')
+        if phase not in ('restoring-previous-audiobook-service-setting',
+                         'activation-failed-previous-setting-restored'):
+            raise RuntimeError('Failed activation is not in the reviewed recovery state')
+        failed = stage / 'failed-installed-override.conf'
+        if not failed.is_file() or failed.read_text() != override:
+            raise RuntimeError('Retained failed override does not match the reviewed change')
+        mounted = command('findmnt', '-rn', '-T', str(MOUNT), '-o', 'TARGET,FSTYPE', timeout=10).split()
+        if mounted != [str(MOUNT), 'fuse.rclone']:
+            raise RuntimeError('Current host Drive FUSE mount is unavailable')
+        try:
+            bound = mount_bound()
+        except (RuntimeError, subprocess.TimeoutExpired):
+            bound = False
+        announce('Current directory cache is 5m; configuration restored. Current Drive bind matches host:', bound)
+        # Keep all earlier backup and failure evidence. Retry gets a new private
+        # directory and fresh database snapshots; never overwrite the old copies.
+        previous_stage = stage
+        owner = stage.stat()
+        stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+        stage = Path(tempfile.mkdtemp(prefix=f'drive-metadata-cache-{stamp}-retry-', dir=recovery))
+        os.chown(stage, owner.st_uid, owner.st_gid)
+        for name, value in [('plan.json', plan), ('container-before.json', previous)]:
+            file = stage / name
+            file.write_text(json.dumps(value, indent=2) + '\n')
+            os.chown(file, owner.st_uid, owner.st_gid)
+        file = stage / 'proposed-override.conf'
+        file.write_text(override)
+        os.chown(file, owner.st_uid, owner.st_gid)
+        originals = stage / 'original-units'
+        originals.mkdir(mode=0o700)
+        os.chown(originals, owner.st_uid, owner.st_gid)
+        for i, file in enumerate(files):
+            backup = originals / f'{i}-{file.name}'
+            backup.write_bytes(file.read_bytes())
+            os.chown(backup, owner.st_uid, owner.st_gid)
+        announce('Retained earlier recovery material:', previous_stage)
+        announce('Fresh activation and rollback material:', stage)
+    elif prior_state.exists():
+        raise RuntimeError('An activation artifact already exists; use reviewed recovery instructions')
     if OVERRIDE.parent.is_symlink():
         raise RuntimeError('Unexpected service override directory')
     installed = False
@@ -327,7 +438,7 @@ def activate(stage_name: str) -> None:
         save('records-after-stop.json', baseline)
         note('restarting-only-drive-audiobook-mount')
         mount_restart_requested = True
-        command('systemctl', 'restart', UNIT, timeout=55)
+        restart_mount()
         _, running = service()
         if running != proposed:
             raise RuntimeError('Restarted mount does not have the reviewed arguments')
@@ -377,7 +488,9 @@ const timer = setTimeout(() => process.exit(124), 45000);
             announce('Progress values changed during startup; current values retained, not overwritten.')
         announce('Rollback material:', stage)
         announce('No audio copied, remote objects changed or unrelated services restarted.')
-    except BaseException:
+    except BaseException as failure:
+        save('activation-failure.json', {'error_type': type(failure).__name__,
+             'reason': str(failure) if isinstance(failure, RuntimeError) else 'private details withheld'})
         for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
             signal.signal(sig, signal.SIG_IGN)
         try:
@@ -387,12 +500,17 @@ const timer = setTimeout(() => process.exit(124), 45000);
                 command('systemctl', 'daemon-reload')
             if mount_restart_requested:
                 command('docker', 'stop', '--timeout', '30', CONTAINER, timeout=45)
-                command('systemctl', 'restart', UNIT, timeout=55)
+                restart_mount()
                 _, restored = service()
                 if restored != args:
                     raise RuntimeError('Original mount arguments could not be verified')
             if stop_requested:
+                mounted = command('findmnt', '-rn', '-T', str(MOUNT), '-o', 'TARGET,FSTYPE').split()
+                if mounted != [str(MOUNT), 'fuse.rclone'] or unit_state().get('Job'):
+                    raise RuntimeError('Original mount is not ready; retaining stopped audiobook container')
                 command('docker', 'start', CONTAINER)
+                if not mount_bound():
+                    raise RuntimeError('Restored audiobook mount binding could not be verified')
             if stop_requested:
                 restored_container, restored_consumers, _ = inventory()
                 if identity(restored_container) != identity(selected) or restored_consumers != expected_consumers:
@@ -400,22 +518,22 @@ const timer = setTimeout(() => process.exit(124), 45000);
             note('activation-failed-previous-setting-restored')
             announce('Current database retained. No database backup was restored. Rollback material:', stage)
         except BaseException:
-            # Make a final bounded attempt to make this existing container available.
-            try:
-                command('docker', 'start', CONTAINER)
-            except BaseException:
-                pass
-            announce('Automatic rollback could not be fully verified. Recovery material:', stage)
+            note('activation-failed-recovery-not-verified')
+            announce('Automatic rollback could not be fully verified. Audiobook container availability is not verified.')
+            announce('Recovery material:', stage)
         raise
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--activate', metavar='STAGED_DIRECTORY')
+    parser.add_argument('--retry', action='store_true', help='Use preserved failed activation material after verifying restored live configuration')
     options = parser.parse_args()
+    if options.retry and not options.activate:
+        parser.error('--retry requires --activate STAGED_DIRECTORY')
     try:
         if options.activate:
-            activate(options.activate)
+            activate(options.activate, retry=options.retry)
         else:
             main()
     except BaseException as error:
