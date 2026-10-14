@@ -61,6 +61,15 @@ selected-image edits, a successful two-service update simulation, and a
 second-service failure/rollback simulation. Simulations are not live server
 verification. As of preparation on 14 October 2026, the live server reported
 v1.3.15 eBooks with the matched mounted handler and local `shelfmark-torbox:test`.
-Deployment completion must be confirmed from the updater's server output and
-`update-state.json`. No additional application release is required for these
+The authorized update subsequently completed on 14 October 2026. The server
+reported both selected services healthy after image and runtime-preservation
+checks, including the adapted eBook handler checksum inside its container.
+Private recovery material is retained at
+`/home/sawdoctor/torbox-recovery-20261011/shelfmark-update-20261014T203659Z-catec3zh`.
+The real Compose pins were updated, both application configuration/database
+backups and old images were retained, and the wrapper removed its downloaded
+temporary updater. No bridge, mount service, Audiobookshelf, Plex or arr
+containers were operated on. No book payloads were copied or deleted.
+This confirms deployment and container health; a new end-to-end acquisition
+was not requested or run as part of this operator update. No additional application release is required for these
 operator scripts: the target TorBox application image is already released.

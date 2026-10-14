@@ -390,3 +390,9 @@ See [Shelfmark service updates](docs/shelfmark-service-updates.md) for the
 prepared versions, private rollback copies and deployment status. The updater
 also replaces a local TorBox test image with the published release without a
 server-side build. These operator changes do not change the release image.
+
+Live deployment confirmed on 14 October 2026: eBooks v1.4.0 with the adapted
+InfiniDysk handler and TorBox `0.1.0-torbox.1` both passed container health and
+runtime preservation checks. Persistent Compose pins and private rollback
+copies were saved; no bridge, Audiobookshelf, Plex, arr or mount services were
+operated on. See the service update guide above for validation limits.
