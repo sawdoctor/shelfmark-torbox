@@ -380,3 +380,13 @@ Use of this tool is entirely at your own risk.
 ## Support
 
 For issues or questions, please [file an issue](https://github.com/sawdoctor/shelfmark-torbox/issues) on GitHub.
+
+## Existing server service updates
+
+The inspected legacy eBook installation has a mounted InfiniDysk handler;
+changing its image alone is insufficient. The version-matched handler and
+scoped updater preserve that behavior while using prebuilt Shelfmark images.
+See [Shelfmark service updates](docs/shelfmark-service-updates.md) for the
+prepared versions, private rollback copies and deployment status. The updater
+also replaces a local TorBox test image with the published release without a
+server-side build. These operator changes do not change the release image.
