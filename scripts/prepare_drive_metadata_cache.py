@@ -275,6 +275,15 @@ def equivalent_replacement(previous: dict, current: dict) -> None:
     announce('Current container ID, hostname and labels will be retained. Changed label keys:', ', '.join(labels) or 'none')
 
 
+def verify_runtime(previous: dict, current: dict, consumers: list[dict], expected: list[dict]) -> bool:
+    """Verify retained audiobook runtime without treating replacement ID as data loss."""
+    if consumers != expected:
+        raise RuntimeError('Drive mount consumer bindings changed unexpectedly')
+    if identity(current) != identity(previous):
+        equivalent_replacement(previous, current)
+    return current['Id'] == previous['Id']
+
+
 def database_snapshot(database: Path, destination: Path) -> dict:
     with sqlite3.connect(database.as_uri() + '?mode=ro', uri=True) as current:
         with sqlite3.connect(destination) as backup:
@@ -425,7 +434,8 @@ def activate(stage_name: str, retry: bool = False) -> None:
             raise RuntimeError('Retry requires the retained failed activation state')
         phase = json.loads(prior_state.read_text()).get('phase')
         if phase not in ('restoring-previous-audiobook-service-setting',
-                         'activation-failed-previous-setting-restored'):
+                         'activation-failed-previous-setting-restored',
+                         'activation-failed-recovery-not-verified'):
             raise RuntimeError('Failed activation is not in the reviewed recovery state')
         failed = stage / 'failed-installed-override.conf'
         if not failed.is_file() or failed.read_text() != override:
@@ -518,8 +528,8 @@ def activate(stage_name: str, retry: bool = False) -> None:
         note('starting-same-audiobook-container')
         command('docker', 'start', CONTAINER)
         current, consumers, running_other_ids = inventory()
-        if identity(current) != identity(selected) or consumers != expected_consumers:
-            raise RuntimeError('Container identity or mount bindings changed unexpectedly')
+        original_container_retained = verify_runtime(selected, current, consumers, expected_consumers)
+        save('container-after-start.json', current)
         if not other_ids <= running_other_ids:
             raise RuntimeError('A previously running unrelated container is no longer running')
         # Device identity proves the container bound the current FUSE superblock.
@@ -545,14 +555,23 @@ const timer = setTimeout(() => process.exit(124), 45000);
             raise RuntimeError('Existing book IDs or paths changed during startup; database retained for investigation')
         if not {row[0] for row in baseline['progress']} <= {row[0] for row in after['progress']}:
             raise RuntimeError('Existing progress records missing after startup; database retained for investigation')
-        save('activation-result.json', {'dir_cache_time': '1h', 'container_identity_preserved': True,
+        final_container, final_consumers, _ = inventory()
+        original_container_retained = verify_runtime(selected, final_container, final_consumers, expected_consumers)
+        if not mount_bound():
+            raise RuntimeError('Final audiobook container does not have the current Drive mount bound')
+        save('container-verified.json', final_container)
+        save('activation-result.json', {'dir_cache_time': '1h',
+             'container_identity_preserved': original_container_retained,
+             'container_runtime_preserved': True,
              'mount_device_verified': True, 'book_records_retained': len(baseline['books']),
              'progress_records_retained': len(baseline['progress']),
              'progress_values_unchanged': baseline['progress'] == after['progress'],
              'metadata_probe': checked, 'playback_improvement': 'not yet measured'})
         note('activation-complete')
         announce('Directory metadata cache: 1h. Polling, audio cache, credentials and audiobook paths unchanged.')
-        announce('Current Drive mount bound inside the same Audiobookshelf container; existing book/progress records retained.')
+        announce('Current Drive mount bound inside verified Audiobookshelf runtime; existing book/progress records retained.')
+        if not original_container_retained:
+            announce('A replacement container ID was observed; actual runtime settings matched the retained snapshot.')
         announce('One metadata lookup after restart: %.2fs. This is not a playback measurement.' % checked['lookupSeconds'])
         if baseline['progress'] != after['progress']:
             announce('Progress values changed during startup; current values retained, not overwritten.')
@@ -583,11 +602,13 @@ const timer = setTimeout(() => process.exit(124), 45000);
                     raise RuntimeError('Restored audiobook mount binding could not be verified')
             if stop_requested:
                 restored_container, restored_consumers, _ = inventory()
-                if identity(restored_container) != identity(selected) or restored_consumers != expected_consumers:
-                    raise RuntimeError('Restored container could not be verified')
+                verify_runtime(selected, restored_container, restored_consumers, expected_consumers)
+                save('container-after-rollback.json', restored_container)
             note('activation-failed-previous-setting-restored')
             announce('Current database retained. No database backup was restored. Rollback material:', stage)
-        except BaseException:
+        except BaseException as rollback_failure:
+            save('rollback-failure.json', {'error_type': type(rollback_failure).__name__,
+                 'reason': str(rollback_failure) if isinstance(rollback_failure, RuntimeError) else 'private details withheld'})
             note('activation-failed-recovery-not-verified')
             announce('Automatic rollback could not be fully verified. Audiobook container availability is not verified.')
             announce('Recovery material:', stage)
