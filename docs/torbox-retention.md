@@ -85,7 +85,9 @@ nonzero exit code and remain visible in the systemd journal.
 
 ## Live installation layout
 
-These are prepared deployment files, not evidence of a live server deployment.
+The table describes the host layout. The recorded installation verified the
+backup-only job and AirLock for three available active sources on 10 October 2026.
+A repository checkout or container update alone does not install these host units.
 Inspect and save the current archive executable, unit files, configuration and
 any existing manifest before replacing them. Do not install while the old
 archiver is running, since it could still rewrite links. Stop scheduling that
@@ -124,3 +126,10 @@ TorBox links without rebuilding or restarting Shelfmark or Audiobookshelf. The
 native protection and cleanup fix can be included in a later approved application
 update. Keep saved copies of the original scripts and units for reference, but
 do not resume the old relinking archiver when rolling back this maintenance job.
+
+## Existing Drive playback libraries
+
+Pre-existing Drive books remain separate from the TorBox backup vault. See
+[legacy Drive playback maintenance](drive-audiobook-playback.md) for the preserved
+filesystem view and persistent one-hour directory metadata policy. Metadata
+expiry does not remove audiobook files or undo AirLock protection.

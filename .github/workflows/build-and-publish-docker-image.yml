@@ -12,7 +12,7 @@ permissions: read-all
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/shelfmark
+  IMAGE_NAME: ${{ github.repository }}
 jobs:
   check-changes:
     runs-on: ubuntu-latest
@@ -89,7 +89,8 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ matrix.image_name_suffix }}
           tags: |
             type=raw,value=dev,enable={{is_default_branch}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
+            type=raw,value=main,enable={{is_default_branch}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') && !contains(github.ref_name, '-') }}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha
@@ -125,7 +126,7 @@ jobs:
   create-aliases:
     needs: build-and-push-images
     runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request'
+    if: github.repository == 'calibrain/shelfmark' && github.event_name != 'pull_request'
     permissions:
       contents: read
       packages: write
