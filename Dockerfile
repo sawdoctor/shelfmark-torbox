@@ -28,7 +28,7 @@ RUN npm run build
 # than copied into the image. A COPY here would land ~24 MB in a `base` layer that
 # every published image inherits, and a later `rm` cannot take it back out again --
 # a RUN adds a layer, it does not rewrite the one underneath.
-FROM ghcr.io/astral-sh/uv:0.12.5@sha256:e85be844203885286c60ffad8a858d48afb6c5a5c237ca0e67f12e74b8f174b1 AS uv
+FROM ghcr.io/astral-sh/uv:0.13.1@sha256:4a1f3666816dafadd20ceb71eac9a7d56d7ef30279f7d64048519ab901ada336 AS uv
 
 # Use python-slim as the base image
 FROM python:3.14.7-slim@sha256:ce40764625a4ff50df3548277632e7f96c4e77fe75fa848aae9885476e7df5a4 AS base
